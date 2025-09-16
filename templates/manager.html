@@ -198,6 +198,8 @@
             border: 1px solid var(--border-color);
             border-radius: 8px;
             font-size: 16px;
+            font-family: 'Inter', sans-serif;
+            resize: vertical;
         }
 
         #addTokenBtn,
@@ -487,7 +489,7 @@
             <div class="token-input-container">
                 <h3>添加 SSO Token</h3>
                 <div class="token-input-section">
-                    <input type="text" id="tokenInput" placeholder="输入新的 SSO Token">
+                    <textarea id="tokenInput" placeholder="输入新的 SSO Token（每行一个）" rows="4"></textarea>
                     <button id="addTokenBtn">添加 Token</button>
                 </div>
             </div>
@@ -760,23 +762,46 @@
 
         document.getElementById('addTokenBtn').addEventListener('click', async () => {
             const tokenInput = document.getElementById('tokenInput');
-            const newToken = tokenInput.value.trim();
-            if (newToken) {
-                try {
-                    const response = await fetch('/manager/api/add', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ sso: newToken })
-                    });
-                    if (response.ok) {
-                        tokenInput.value = '';
-                        await fetchTokenMap();
-                        showNotification('Token 添加成功');
-                    } else {
-                        showNotification('添加 Token 失败');
+            const tokenText = tokenInput.value.trim();
+            if (tokenText) {
+                const tokens = tokenText.split('\n')
+                    .map(token => token.trim())
+                    .filter(token => token.length > 0);
+
+                if (tokens.length === 0) {
+                    showNotification('请输入至少一个有效的 Token');
+                    return;
+                }
+
+                let successCount = 0;
+                let failCount = 0;
+
+                for (const newToken of tokens) {
+                    try {
+                        const response = await fetch('/manager/api/add', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ sso: newToken })
+                        });
+                        if (response.ok) {
+                            successCount++;
+                        } else {
+                            failCount++;
+                        }
+                    } catch (error) {
+                        failCount++;
                     }
-                } catch (error) {
-                    showNotification('添加 Token 出错');
+                }
+
+                tokenInput.value = '';
+                await fetchTokenMap();
+
+                if (successCount > 0 && failCount === 0) {
+                    showNotification(`成功添加 ${successCount} 个 Token`);
+                } else if (successCount > 0 && failCount > 0) {
+                    showNotification(`成功添加 ${successCount} 个，失败 ${failCount} 个 Token`);
+                } else {
+                    showNotification(`添加失败，共 ${failCount} 个 Token 失败`);
                 }
             }
         });
