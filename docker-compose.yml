@@ -1,6 +1,6 @@
 services:
   grok2api:
-    image: VeroFess/grok2api
+    image: verofess/grok2api
     container_name: grok2api
     environment:
       - API_KEY=sk-api-key-demo-you-should-change-it
