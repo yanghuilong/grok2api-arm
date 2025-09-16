@@ -37,3 +37,42 @@
 | `PICGO_KEY` | PICGO 图床 API 密钥 | - | 字符串 | `picgo_api_key` |
 | `TUMY_KEY` | Tumy 图床 API 密钥 | - | 字符串 | `tumy_api_key` |
 | `FILTERED_TAGS` | 过滤标签列表 | `xaiArtifact` | 逗号分隔 | `tag1,tag2,tag3` |
+
+## 快速开始
+
+### 使用 Docker Hub 镜像
+
+现在可以直接从 Docker Hub 拉取预构建的镜像：
+
+```bash
+# 拉取镜像
+docker pull verofess/grok2api
+
+# 运行容器
+docker run -d \
+  --name grok2api \
+  -p 5200:5200 \
+  -e API_KEY=sk-your-api-key \
+  -e SSO=your-sso-token \
+  verofess/grok2api
+
+# 或者使用 docker-compose
+docker-compose up -d
+```
+
+### Docker Compose 示例
+
+```yaml
+services:
+  grok2api:
+    image: verofess/grok2api
+    container_name: grok2api
+    ports:
+      - "5200:5200"
+    environment:
+      - API_KEY=sk-your-api-key
+      - SSO=your-sso-token
+      - IS_TEMP_CONVERSATION=true
+      - SHOW_THINKING=false
+    restart: unless-stopped
+```
