@@ -1,0 +1,13 @@
+services:
+  grok2api:
+    build: .
+    container_name: grok2api
+    environment:
+      - API_KEY=sk-api-key-demo-you-should-change-it
+      - IS_TEMP_CONVERSATION=true
+      - SHOW_SEARCH_RESULTS=true
+      - SHOW_THINKING=true
+    volumes:
+      - ./data:/data
+    ports:
+      - 5200:5200
