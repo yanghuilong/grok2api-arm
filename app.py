@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import json
 import uuid
@@ -31,7 +33,7 @@ from flask import (
 )
 from curl_cffi import requests as curl_requests
 from werkzeug.middleware.proxy_fix import ProxyFix
-from patchright.async_api import async_playwright, Browser, BrowserContext
+from playwright.async_api import async_playwright, Browser, BrowserContext
 
 
 class PlaywrightStatsigManager:
@@ -59,16 +61,14 @@ class PlaywrightStatsigManager:
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-
                 import concurrent.futures
 
-                with concurrent.futures.ThreadPoolExecutor() as executor:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(asyncio.run, coro)
-                    return future.result()
+                    return future.result(timeout=300)
             else:
                 return loop.run_until_complete(coro)
         except RuntimeError:
-
             return asyncio.run(coro)
 
     async def _ensure_browser(self):
@@ -223,7 +223,7 @@ class PlaywrightStatsigManager:
         """Trigger a real request to grok.com to capture x-statsig-id"""
         try:
 
-            await page.wait_for_selector("div.relative.z-10 textarea", timeout=2000)
+            await page.wait_for_selector("div.relative.z-10 textarea", timeout=30000)
 
             import random
             import string
@@ -448,21 +448,32 @@ BASE_HEADERS = {
 
 
 def get_dynamic_headers(
-    method: str = "POST", pathname: str = "/rest/app-chat/conversations/new"
+    method: str = "POST",
+    pathname: str = "/rest/app-chat/conversations/new",
+    config: Optional["ConfigurationManager"] = None,
 ) -> Dict[str, str]:
     """
-    Get headers with dynamic x-statsig-id and x-xai-request-id
+    Get headers with dynamic x-statsig-id and x-xai-request-id or fallback headers
 
     Args:
         method: HTTP method for the request
         pathname: Request pathname for statsig generation
+        config: Configuration manager to check if dynamic headers are disabled
 
     Returns:
-        Dictionary with all headers including dynamic ones
+        Dictionary with all headers including dynamic ones or fallback
     """
     try:
-
         headers = BASE_HEADERS.copy()
+
+        # Check if dynamic headers are disabled
+        if config and config.get("API.DISABLE_DYNAMIC_HEADERS", False):
+            print("Dynamic headers disabled, using fallback headers")
+            headers["x-xai-request-id"] = str(uuid.uuid4())
+            headers["x-statsig-id"] = (
+                "ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGlsZE5vZGVzJyk="
+            )
+            return headers
 
         statsig_manager = get_statsig_manager()
         dynamic_headers = statsig_manager.get_dynamic_headers(method, pathname)
@@ -523,6 +534,14 @@ class TokenCredential:
             raise ValidationException("SSO token cannot be empty")
         if "sso=" not in self.sso_token:
             raise ValidationException("Invalid SSO token format")
+        try:
+            parts = self.sso_token.split("sso=")
+            if len(parts) < 2 or not parts[1]:
+                raise ValidationException(
+                    "Invalid SSO token format: missing value after 'sso='"
+                )
+        except Exception as e:
+            raise ValidationException(f"Invalid SSO token format: {e}")
 
     @classmethod
     def from_raw_token(
@@ -532,7 +551,11 @@ class TokenCredential:
         if not raw_token or not raw_token.strip():
             raise ValidationException("Raw token cannot be empty")
 
-        formatted_token = f"sso-rw={raw_token.strip()};sso={raw_token.strip()}"
+        sanitized_token = raw_token.strip()
+        if ";" in sanitized_token:
+            raise ValidationException("Raw token contains invalid character (';')")
+
+        formatted_token = f"sso-rw={sanitized_token};sso={sanitized_token}"
         return cls(formatted_token, token_type)
 
     def extract_sso_value(self) -> str:
@@ -817,10 +840,11 @@ class ConfigurationManager:
                 "IS_CUSTOM_SSO": self._get_bool_env("IS_CUSTOM_SSO", False),
                 "BASE_URL": "https://grok.com",
                 "API_KEY": os.environ.get("API_KEY", "sk-123456"),
-                "PICGO_KEY": os.environ.get("PICGO_KEY"),
-                "TUMY_KEY": os.environ.get("TUMY_KEY"),
                 "RETRY_TIME": 1000,
                 "PROXY": os.environ.get("PROXY"),
+                "DISABLE_DYNAMIC_HEADERS": self._get_bool_env(
+                    "DISABLE_DYNAMIC_HEADERS", False
+                ),
             },
             "ADMIN": {
                 "MANAGER_SWITCH": os.environ.get("MANAGER_SWITCH"),
@@ -838,7 +862,18 @@ class ConfigurationManager:
             "SHOW_THINKING": self._get_bool_env("SHOW_THINKING", False),
             "SHOW_SEARCH_RESULTS": self._get_bool_env("SHOW_SEARCH_RESULTS", True),
             "IS_SUPER_GROK": self._get_bool_env("IS_SUPER_GROK", False),
-            "FILTERED_TAGS": self._get_list_env("FILTERED_TAGS", ["xaiArtifact"]),
+            "FILTERED_TAGS": self._get_list_env(
+                "FILTERED_TAGS",
+                [
+                    "xaiartifact",
+                    "xai:tool_usage_card",
+                    "grok:render",
+                    "details",
+                    "summary",
+                ],
+            ),
+            "TAG_CONFIG": self._get_tag_config(),
+            "CONTENT_TYPE_MAPPINGS": self._get_content_type_mappings(),
         }
 
     def _get_bool_env(self, key: str, default: bool = False) -> bool:
@@ -851,6 +886,154 @@ class ConfigurationManager:
         if not value:
             return default
         return [tag.strip() for tag in value.split(",") if tag.strip()]
+
+    def _get_content_type_mappings(self) -> Dict[str, Dict[str, str]]:
+        """Get content type mappings from environment or defaults."""
+        mappings_env = os.environ.get("CONTENT_TYPE_MAPPINGS")
+        if mappings_env:
+            try:
+                return json.loads(mappings_env)
+            except json.JSONDecodeError:
+                print("Invalid CONTENT_TYPE_MAPPINGS JSON, using defaults")
+
+        return {
+            "text/plain": {"stag": "```", "etag": "```"},
+            "text/markdown": {"stag": "", "etag": ""},
+            "application/json": {"stag": "```json\n", "etag": "\n```"},
+            "text/javascript": {"stag": "```javascript\n", "etag": "\n```"},
+            "text/python": {"stag": "```python\n", "etag": "\n```"},
+            "text/html": {"stag": "```html\n", "etag": "\n```"},
+            "text/css": {"stag": "```css\n", "etag": "\n```"},
+            "text/xml": {"stag": "```xml\n", "etag": "\n```"},
+            "application/xml": {"stag": "```xml\n", "etag": "\n```"},
+            "text/yaml": {"stag": "```yaml\n", "etag": "\n```"},
+            "application/yaml": {"stag": "```yaml\n", "etag": "\n```"},
+            "text/x-yaml": {"stag": "```yaml\n", "etag": "\n```"},
+            "text/sql": {"stag": "```sql\n", "etag": "\n```"},
+            "application/sql": {"stag": "```sql\n", "etag": "\n```"},
+            "text/x-sql": {"stag": "```sql\n", "etag": "\n```"},
+            "text/typescript": {"stag": "```typescript\n", "etag": "\n```"},
+            "application/typescript": {"stag": "```typescript\n", "etag": "\n```"},
+            "text/x-typescript": {"stag": "```typescript\n", "etag": "\n```"},
+            "text/jsx": {"stag": "```jsx\n", "etag": "\n```"},
+            "text/x-jsx": {"stag": "```jsx\n", "etag": "\n```"},
+            "text/tsx": {"stag": "```tsx\n", "etag": "\n```"},
+            "text/x-tsx": {"stag": "```tsx\n", "etag": "\n```"},
+            "text/java": {"stag": "```java\n", "etag": "\n```"},
+            "application/java": {"stag": "```java\n", "etag": "\n```"},
+            "text/x-java": {"stag": "```java\n", "etag": "\n```"},
+            "text/csharp": {"stag": "```csharp\n", "etag": "\n```"},
+            "text/x-csharp": {"stag": "```csharp\n", "etag": "\n```"},
+            "application/x-csharp": {"stag": "```csharp\n", "etag": "\n```"},
+            "text/cpp": {"stag": "```cpp\n", "etag": "\n```"},
+            "text/x-c++": {"stag": "```cpp\n", "etag": "\n```"},
+            "application/x-cpp": {"stag": "```cpp\n", "etag": "\n```"},
+            "text/c": {"stag": "```c\n", "etag": "\n```"},
+            "text/x-c": {"stag": "```c\n", "etag": "\n```"},
+            "text/go": {"stag": "```go\n", "etag": "\n```"},
+            "text/x-go": {"stag": "```go\n", "etag": "\n```"},
+            "application/x-go": {"stag": "```go\n", "etag": "\n```"},
+            "text/rust": {"stag": "```rust\n", "etag": "\n```"},
+            "text/x-rust": {"stag": "```rust\n", "etag": "\n```"},
+            "application/x-rust": {"stag": "```rust\n", "etag": "\n```"},
+            "text/php": {"stag": "```php\n", "etag": "\n```"},
+            "application/x-php": {"stag": "```php\n", "etag": "\n```"},
+            "text/ruby": {"stag": "```ruby\n", "etag": "\n```"},
+            "application/x-ruby": {"stag": "```ruby\n", "etag": "\n```"},
+            "text/swift": {"stag": "```swift\n", "etag": "\n```"},
+            "text/x-swift": {"stag": "```swift\n", "etag": "\n```"},
+            "text/kotlin": {"stag": "```kotlin\n", "etag": "\n```"},
+            "text/x-kotlin": {"stag": "```kotlin\n", "etag": "\n```"},
+            "text/scala": {"stag": "```scala\n", "etag": "\n```"},
+            "text/x-scala": {"stag": "```scala\n", "etag": "\n```"},
+            "text/bash": {"stag": "```bash\n", "etag": "\n```"},
+            "text/x-bash": {"stag": "```bash\n", "etag": "\n```"},
+            "application/x-bash": {"stag": "```bash\n", "etag": "\n```"},
+            "text/shell": {"stag": "```bash\n", "etag": "\n```"},
+            "text/x-shell": {"stag": "```bash\n", "etag": "\n```"},
+            "application/x-shell": {"stag": "```bash\n", "etag": "\n```"},
+            "text/powershell": {"stag": "```powershell\n", "etag": "\n```"},
+            "text/x-powershell": {"stag": "```powershell\n", "etag": "\n```"},
+            "application/x-powershell": {"stag": "```powershell\n", "etag": "\n```"},
+            "text/dockerfile": {"stag": "```dockerfile\n", "etag": "\n```"},
+            "text/x-dockerfile": {"stag": "```dockerfile\n", "etag": "\n```"},
+            "application/x-dockerfile": {"stag": "```dockerfile\n", "etag": "\n```"},
+            "text/toml": {"stag": "```toml\n", "etag": "\n```"},
+            "application/toml": {"stag": "```toml\n", "etag": "\n```"},
+            "text/ini": {"stag": "```ini\n", "etag": "\n```"},
+            "text/x-ini": {"stag": "```ini\n", "etag": "\n```"},
+            "application/x-ini": {"stag": "```ini\n", "etag": "\n```"},
+            "text/properties": {"stag": "```properties\n", "etag": "\n```"},
+            "text/x-properties": {"stag": "```properties\n", "etag": "\n```"},
+            "text/csv": {"stag": "```csv\n", "etag": "\n```"},
+            "application/csv": {"stag": "```csv\n", "etag": "\n```"},
+            "text/x-csv": {"stag": "```csv\n", "etag": "\n```"},
+            "text/log": {"stag": "```\n", "etag": "\n```"},
+            "application/x-log": {"stag": "```\n", "etag": "\n```"},
+            "text/x-log": {"stag": "```\n", "etag": "\n```"},
+            "application/x-httpd-php": {"stag": "```php\n", "etag": "\n```"},
+            "text/x-python": {"stag": "```python\n", "etag": "\n```"},
+            "application/x-python": {"stag": "```python\n", "etag": "\n```"},
+            "text/x-javascript": {"stag": "```javascript\n", "etag": "\n```"},
+            "application/javascript": {"stag": "```javascript\n", "etag": "\n```"},
+            "text/ecmascript": {"stag": "```javascript\n", "etag": "\n```"},
+            "application/ecmascript": {"stag": "```javascript\n", "etag": "\n```"},
+            "text/jscript": {"stag": "```javascript\n", "etag": "\n```"},
+            "application/x-javascript": {"stag": "```javascript\n", "etag": "\n```"},
+            "text/vbscript": {"stag": "```vbscript\n", "etag": "\n```"},
+            "application/x-vbscript": {"stag": "```vbscript\n", "etag": "\n```"},
+            "text/x-markdown": {"stag": "", "etag": ""},
+            "application/x-markdown": {"stag": "", "etag": ""},
+            "text/x-web-markdown": {"stag": "", "etag": ""},
+            "code/python": {"stag": "```python\n", "etag": "\n```"},
+            "code/javascript": {"stag": "```javascript\n", "etag": "\n```"},
+            "code/typescript": {"stag": "```typescript\n", "etag": "\n```"},
+            "code/html": {"stag": "```html\n", "etag": "\n```"},
+            "code/css": {"stag": "```css\n", "etag": "\n```"},
+            "code/json": {"stag": "```json\n", "etag": "\n```"},
+            "code/xml": {"stag": "```xml\n", "etag": "\n```"},
+            "code/yaml": {"stag": "```yaml\n", "etag": "\n```"},
+            "code/sql": {"stag": "```sql\n", "etag": "\n```"},
+            "code/bash": {"stag": "```bash\n", "etag": "\n```"},
+            "code/shell": {"stag": "```bash\n", "etag": "\n```"},
+            "code/dockerfile": {"stag": "```dockerfile\n", "etag": "\n```"},
+            "text/code": {"stag": "```\n", "etag": "\n```"},
+            "application/code": {"stag": "```\n", "etag": "\n```"},
+            "text/source": {"stag": "```\n", "etag": "\n```"},
+            "application/source": {"stag": "```\n", "etag": "\n```"},
+        }
+
+    def _get_tag_config(self) -> Dict[str, Dict[str, Any]]:
+        """Get tag configuration from environment or defaults."""
+        tag_config_env = os.environ.get("TAG_CONFIG")
+        if tag_config_env:
+            try:
+                return json.loads(tag_config_env)
+            except json.JSONDecodeError:
+                print("Invalid TAG_CONFIG JSON, using defaults")
+
+        filtered_tags = self._get_list_env(
+            "FILTERED_TAGS",
+            ["xaiartifact", "xai:tool_usage_card", "grok:render", "details", "summary"],
+        )
+        default_config = {}
+
+        for tag in filtered_tags:
+            if tag.lower() in ["xai:tool_usage_card", "grok:render"]:
+                default_config[tag.lower()] = {"behavior": "remove_all"}
+            else:
+                default_config[tag.lower()] = {"behavior": "preserve_content"}
+
+        if not default_config:
+            default_config = {
+                "xaiartifact": {"behavior": "preserve_content"},
+                "xai:tool_usage_card": {"behavior": "remove_all"},
+                "grok:render": {"behavior": "remove_all"},
+                "details": {"behavior": "preserve_content"},
+                "summary": {"behavior": "preserve_content"},
+            }
+
+        return default_config
 
     def _validate_configuration(self) -> None:
         """Validate configuration settings."""
@@ -1892,7 +2075,9 @@ class FileUploadManager:
             response = curl_requests.post(
                 "https://grok.com/rest/app-chat/upload-file",
                 headers={
-                    **get_dynamic_headers("POST", "/rest/app-chat/upload-file"),
+                    **get_dynamic_headers(
+                        "POST", "/rest/app-chat/upload-file", self.config
+                    ),
                     "Cookie": cookie,
                 },
                 json=upload_data,
@@ -1956,7 +2141,9 @@ class FileUploadManager:
             response = curl_requests.post(
                 "https://grok.com/rest/app-chat/upload-file",
                 headers={
-                    **get_dynamic_headers("POST", "/rest/app-chat/upload-file"),
+                    **get_dynamic_headers(
+                        "POST", "/rest/app-chat/upload-file", self.config
+                    ),
                     "Cookie": cookie,
                 },
                 json=upload_data,
@@ -2166,16 +2353,6 @@ class GrokApiClient:
         if model not in self.config.models:
             raise ValidationException(f"Unsupported model: {model}")
 
-        if (
-            model in ["grok-4-imageGen", "grok-3-imageGen"]
-            and request_data.get("stream", False)
-            and not self.config.get("API.PICGO_KEY")
-            and not self.config.get("API.TUMY_KEY")
-        ):
-            raise ValidationException(
-                "Image generation models require PICGO or TUMY API key for streaming"
-            )
-
         return self.config.models[model]
 
     def determine_search_and_generation_settings(self, model: str) -> tuple:
@@ -2267,7 +2444,12 @@ class GrokApiClient:
 
     def build_request_payload(self, config: ChatRequestConfig) -> Dict[str, Any]:
         """Build the final request payload."""
-        return {
+
+        model_mode = "MODEL_MODE_AUTO"
+        if config.deepsearch_preset in ["default", "deeper"]:
+            model_mode = "MODEL_MODE_EXPERT"
+
+        payload = {
             "temporary": config.temporary_conversation,
             "modelName": config.model_name,
             "message": config.message,
@@ -2277,24 +2459,26 @@ class GrokApiClient:
             "enableImageGeneration": config.enable_image_generation,
             "returnImageBytes": False,
             "returnRawGrokInXaiRequest": False,
-            "enableImageStreaming": False,
-            "imageGenerationCount": 1,
+            "enableImageStreaming": True,
+            "imageGenerationCount": 2,
             "forceConcise": False,
-            "toolOverrides": {
-                "imageGen": config.enable_image_generation,
-                "webSearch": config.enable_search,
-                "xSearch": config.enable_search,
-                "xMediaSearch": config.enable_search,
-                "trendsSearch": config.enable_search,
-                "xPostAnalyze": config.enable_search,
-            },
+            "toolOverrides": {},
             "enableSideBySide": True,
             "sendFinalMetadata": True,
-            "customPersonality": "",
-            "deepsearchPreset": config.deepsearch_preset,
             "isReasoning": config.enable_reasoning,
+            "webpageUrls": [],
             "disableTextFollowUps": True,
+            "responseMetadata": {"requestModelDetails": {"modelId": config.model_name}},
+            "disableMemory": False,
+            "forceSideBySide": False,
+            "modelMode": model_mode,
+            "isAsyncChat": False,
         }
+
+        if config.deepsearch_preset:
+            payload["deepsearchPreset"] = config.deepsearch_preset
+
+        return payload
 
     def make_request(
         self, payload: Dict[str, Any], model: str, stream: bool = False
@@ -2325,7 +2509,9 @@ class GrokApiClient:
             response = curl_requests.post(
                 f"{self.config.get('API.BASE_URL')}/rest/app-chat/conversations/new",
                 headers={
-                    **get_dynamic_headers("POST", "/rest/app-chat/conversations/new"),
+                    **get_dynamic_headers(
+                        "POST", "/rest/app-chat/conversations/new", self.config
+                    ),
                     "Cookie": cookie,
                 },
                 data=json.dumps(payload),
@@ -2365,6 +2551,20 @@ class ModelResponseProcessor:
     ) -> ProcessingResult:
         """Process model response based on model type and current state."""
         try:
+            streaming_image_response = response_data.get(
+                "streamingImageGenerationResponse"
+            )
+            if streaming_image_response:
+                progress = streaming_image_response.get("progress", 0)
+                image_url = streaming_image_response.get("imageUrl")
+
+                if progress == 100 and image_url:
+                    new_state = current_state.with_image_generation(True, 1)
+                    return ProcessingResult(image_url=image_url, new_state=new_state)
+                else:
+                    new_state = current_state.with_image_generation(True)
+                    return ProcessingResult(new_state=new_state)
+
             if response_data.get("doImgGen") or response_data.get(
                 "imageAttachmentInfo"
             ):
@@ -2380,6 +2580,14 @@ class ModelResponseProcessor:
                         return ProcessingResult(
                             image_url=image_url, new_state=new_state
                         )
+
+            model_response = response_data.get("modelResponse")
+            if model_response:
+                generated_image_urls = model_response.get("generatedImageUrls", [])
+                if generated_image_urls:
+                    image_url = generated_image_urls[0]
+                    new_state = current_state.with_image_generation(True, 1)
+                    return ProcessingResult(image_url=image_url, new_state=new_state)
 
             if model == "grok-3":
                 return self._process_grok_3_response(response_data, current_state)
@@ -2558,14 +2766,24 @@ class ModelResponseProcessor:
 
 
 class ResponseImageHandler:
-    """Handles image responses and uploads to image hosting services."""
+    """Handles image responses with memory caching and OpenAI-compatible format."""
 
     def __init__(self, config: ConfigurationManager):
-        """Initialize image handler."""
+        """Initialize image handler with memory cache."""
         self.config = config
+        self._cache = {}
+        self._cache_lock = threading.Lock()
+        self.max_cache_size = 1024 * 1024 * 16
+        self.cache_access_order = []
 
-    def handle_image_response(self, image_url: str) -> str:
-        """Process image response and return appropriate format."""
+    def handle_image_response(self, image_url: str) -> dict:
+        """Process image response and return OpenAI-compatible format with caching."""
+        with self._cache_lock:
+            if image_url in self._cache:
+                self.cache_access_order.remove(image_url)
+                self.cache_access_order.append(image_url)
+                return self._cache[image_url]
+
         max_retries = 2
         retry_count = 0
         image_data = None
@@ -2578,7 +2796,9 @@ class ResponseImageHandler:
 
                 response = curl_requests.get(
                     f"https://assets.grok.com/{image_url}",
-                    headers=get_dynamic_headers("GET", f"/assets/{image_url}"),
+                    headers=get_dynamic_headers(
+                        "GET", f"/assets/{image_url}", self.config
+                    ),
                     impersonate="chrome133a",
                     timeout=60,
                     **proxy_config,
@@ -2608,177 +2828,390 @@ class ResponseImageHandler:
         if not image_data:
             raise GrokApiException("No image data retrieved", "NO_IMAGE_DATA")
 
-        picgo_key = self.config.get("API.PICGO_KEY")
-        tumy_key = self.config.get("API.TUMY_KEY")
-
-        if not picgo_key and not tumy_key:
-            base64_image = base64.b64encode(image_data).decode("utf-8")
-            content_type = "image/jpeg"
-            return f"![image](data:{content_type};base64,{base64_image})"
-
-        print("Uploading to image hosting service")
-
-        if picgo_key:
-            return self._upload_to_picgo(image_data, picgo_key)
-        elif tumy_key:
-            return self._upload_to_tumy(image_data, tumy_key)
-
         base64_image = base64.b64encode(image_data).decode("utf-8")
-        return f"![image](data:image/jpeg;base64,{base64_image})"
+        content_type = "image/jpeg"
+        data_url = f"data:{content_type};base64,{base64_image}"
 
-    def _upload_to_picgo(self, image_data: bytes, api_key: str) -> str:
-        """Upload image to PicGo service."""
-        try:
-            files = {"source": ("image.jpg", image_data, "image/jpeg")}
-            headers = {"X-API-Key": api_key}
+        image_content = {"type": "image_url", "image_url": {"url": data_url}}
 
-            response = requests.post(
-                "https://www.picgo.net/api/1/upload",
-                files=files,
-                headers=headers,
-                timeout=30,
-            )
+        with self._cache_lock:
+            if len(self._cache) >= self.max_cache_size and image_url not in self._cache:
+                oldest_key = self.cache_access_order.pop(0)
+                del self._cache[oldest_key]
 
-            if response.status_code == 200:
-                result = response.json()
-                image_url = result.get("image", {}).get("url", "")
-                if image_url:
-                    print("Image uploaded to PicGo successfully", "ImageHandler")
-                    return f"![image]({image_url})"
+            self._cache[image_url] = image_content
+            if image_url not in self.cache_access_order:
+                self.cache_access_order.append(image_url)
 
-            print(f"PicGo upload failed: {response.status_code}", "ImageHandler")
-            return "Image generation failed - PicGo upload error"
+        return image_content
 
-        except Exception as e:
-            print(f"PicGo upload exception: {e}")
-            return "Image generation failed - PicGo service error"
 
-    def _upload_to_tumy(self, image_data: bytes, api_key: str) -> str:
-        """Upload image to TuMy service."""
-        try:
-            files = {"file": ("image.jpg", image_data, "image/jpeg")}
-            headers = {
-                "Accept": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            }
+from enum import Enum
 
-            response = requests.post(
-                "https://tu.my/api/v1/upload", files=files, headers=headers, timeout=30
-            )
 
-            if response.status_code == 200:
-                result = response.json()
-                image_url = result.get("data", {}).get("links", {}).get("url", "")
-                if image_url:
-                    print("Image uploaded to TuMy successfully", "ImageHandler")
-                    return f"![image]({image_url})"
+class FilterState(Enum):
+    """States for the streaming tag filter state machine."""
 
-            print(f"TuMy upload failed: {response.status_code}", "ImageHandler")
-            return "Image generation failed - TuMy upload error"
+    NORMAL = "normal"
+    POTENTIAL_TAG = "potential_tag"
+    IN_FILTERED_TAG = "in_filtered_tag"
+    IN_PRESERVED_TAG = "in_preserved_tag"
+    IN_CDATA = "in_cdata"
+    TAG_ANALYSIS = "tag_analysis"
 
-        except Exception as e:
-            print(f"TuMy upload exception: {e}")
-            return "Image generation failed - TuMy service error"
+
+class TagBehavior(Enum):
+    """Behavior types for filtered tags."""
+
+    PRESERVE_CONTENT = "preserve_content"
+    REMOVE_ALL = "remove_all"
 
 
 class StreamingTagFilter:
-    """Configurable streaming filter for removing specified XML/HTML tags."""
+    """High-performance state machine-based streaming filter with minimal buffering and per-stream independence."""
 
-    def __init__(self, filtered_tags: List[str] = []):
+    def __init__(
+        self,
+        tag_config: Dict[str, Dict[str, Any]] = {},
+        content_type_mappings: Dict[str, Dict[str, str]] = {},
+    ):
         """
-        Initialize filter with configurable tag list.
+        Initialize filter with configurable tag behaviors and contentType mappings.
 
         Args:
-            filtered_tags: List of tag names to filter (case-insensitive)
-                          e.g., ["xaiArtifact", "someOtherTag"]
+            tag_config: Dict mapping tag names to their behavior configuration
+                       e.g., {
+                           "xaiartifact": {"behavior": "preserve_content"},
+                           "grok:render": {"behavior": "remove_all"}
+                       }
+            content_type_mappings: Dict mapping contentTypes to replacement tags
         """
-        self.buffer = ""
-        self.filtered_tags = [tag.lower() for tag in (filtered_tags or ["xaiArtifact"])]
+        self.tag_config = {}
+        default_config = tag_config or {
+            "xaiartifact": {"behavior": "preserve_content"},
+            "grok:render": {"behavior": "remove_all"},
+        }
 
-    def _starts_with_special_tag(self, text: str) -> bool:
-        """Check if text starts with any of our special tag patterns."""
-        if not text.startswith("<"):
+        for tag_name, config in default_config.items():
+            self.tag_config[tag_name.lower()] = {
+                "behavior": TagBehavior(config.get("behavior", "preserve_content")),
+                "extra_config": config.get("extra_config", {}),
+            }
+        self.content_type_mappings = content_type_mappings or {
+            "text/plain": {"stag": "```", "etag": "```"},
+            "text/markdown": {"stag": "", "etag": ""},
+            "application/json": {"stag": "```json\n", "etag": "\n```"},
+            "text/javascript": {"stag": "```javascript\n", "etag": "\n```"},
+            "text/python": {"stag": "```python\n", "etag": "\n```"},
+            "text/html": {"stag": "```html\n", "etag": "\n```"},
+            "text/css": {"stag": "```css\n", "etag": "\n```"},
+            "text/xml": {"stag": "```xml\n", "etag": "\n```"},
+            "text/yaml": {"stag": "```yaml\n", "etag": "\n```"},
+            "text/sql": {"stag": "```sql\n", "etag": "\n```"},
+            "text/typescript": {"stag": "```typescript\n", "etag": "\n```"},
+            "text/bash": {"stag": "```bash\n", "etag": "\n```"},
+            "text/shell": {"stag": "```bash\n", "etag": "\n```"},
+            "text/dockerfile": {"stag": "```dockerfile\n", "etag": "\n```"},
+            "text/java": {"stag": "```java\n", "etag": "\n```"},
+            "text/go": {"stag": "```go\n", "etag": "\n```"},
+            "text/rust": {"stag": "```rust\n", "etag": "\n```"},
+            "text/php": {"stag": "```php\n", "etag": "\n```"},
+            "text/ruby": {"stag": "```ruby\n", "etag": "\n```"},
+            "text/swift": {"stag": "```swift\n", "etag": "\n```"},
+            "text/kotlin": {"stag": "```kotlin\n", "etag": "\n```"},
+            "text/cpp": {"stag": "```cpp\n", "etag": "\n```"},
+            "text/c": {"stag": "```c\n", "etag": "\n```"},
+            "text/csharp": {"stag": "```csharp\n", "etag": "\n```"},
+            "text/code": {"stag": "```\n", "etag": "\n```"},
+            "application/code": {"stag": "```\n", "etag": "\n```"},
+        }
+
+        self.reset_state()
+
+    def _get_tag_behavior(self, tag_name: str) -> Optional[TagBehavior]:
+        """Get the configured behavior for a tag."""
+        config = self.tag_config.get(tag_name.lower())
+        return config["behavior"] if config else None
+
+    def _is_filtered_tag(self, tag_name: str) -> bool:
+        """Check if a tag is configured for filtering."""
+        return tag_name.lower() in self.tag_config
+
+    def reset_state(self):
+        """Reset the filter state (useful for reusing filter instances)."""
+        self.state = FilterState.NORMAL
+        self.buffer = ""
+        self.tag_stack = []
+        self.temp_output = ""
+        self.has_mismatched_closing_tags = False
+
+        self.has_filtered_tags_in_text = False
+        self.last_char_was_lt = False
+
+    def _quick_scan_for_filtered_content(self, text: str) -> bool:
+        """Quick scan to see if text potentially contains filtered content."""
+        if not text or "<" not in text:
             return False
 
         text_lower = text.lower()
 
-        if text_lower.startswith("</"):
-            tag_part = text_lower[2:]
-            for tag in self.filtered_tags:
-                if tag.startswith(tag_part) or text_lower.startswith(f"</{tag}"):
-                    return True
+        if "<![cdata[" in text_lower:
+            return True
 
-        else:
-            tag_part = text_lower[1:]
-            for tag in self.filtered_tags:
-                if tag.startswith(tag_part) or text_lower.startswith(f"<{tag}"):
-                    return True
+        for tag_name in self.tag_config.keys():
+            if f"<{tag_name}" in text_lower or f"</{tag_name}" in text_lower:
+                return True
 
         return False
 
-    def _extract_tag_name(self, tag_text: str) -> str:
-        """Extract the tag name from a complete tag."""
-        if not tag_text.startswith("<"):
+    def _extract_tag_name_quick(self, tag_content: str) -> str:
+        """Quick tag name extraction for performance."""
+        if not tag_content:
             return ""
 
-        if tag_text.startswith("</"):
-            content = tag_text[2:]
+        if tag_content.startswith("/"):
+            tag_content = tag_content[1:]
+
+        if tag_content.endswith("/"):
+            tag_content = tag_content[:-1]
+
+        parts = tag_content.split(None, 1)
+        return parts[0].lower() if parts else ""
+
+    def _extract_content_type(self, tag_content: str) -> Optional[str]:
+        """Extract contentType attribute from tag."""
+        match = re.search(
+            r'contentType=["\']([^"\'>]+)["\']', tag_content, re.IGNORECASE
+        )
+        return match.group(1) if match else None
+
+    def _should_preserve_content(
+        self, tag_name: str, content_type: Optional[str]
+    ) -> bool:
+        """Check if tag content should be preserved with replacement."""
+        behavior = self._get_tag_behavior(tag_name)
+        return behavior == TagBehavior.PRESERVE_CONTENT
+
+    def _get_content_replacement(self, content_type: Optional[str]) -> Dict[str, str]:
+        """Get replacement mapping for content type, with fallback to plain text."""
+        if content_type and content_type in self.content_type_mappings:
+            return self.content_type_mappings[content_type]
+        return {"stag": "", "etag": ""}
+
+    def _process_complete_tag(self, tag_text: str) -> str:
+        """Process a complete tag and return appropriate output."""
+        if not tag_text.startswith("<") or not tag_text.endswith(">"):
+            return tag_text
+
+        tag_content = tag_text[1:-1]
+
+        if tag_content.lower().startswith("![cdata["):
+            return ""
+
+        tag_name = self._extract_tag_name_quick(tag_content)
+        behavior = self._get_tag_behavior(tag_name)
+
+        if behavior is None:
+            return tag_text
+
+        is_closing = tag_content.startswith("/")
+        is_self_closing = tag_content.endswith("/")
+
+        if is_closing:
+            matched = False
+            for i in range(len(self.tag_stack) - 1, -1, -1):
+                if self.tag_stack[i]["name"] == tag_name:
+                    tag_entry = self.tag_stack.pop(i)
+                    self.tag_stack = self.tag_stack[:i]
+                    matched = True
+
+                    if tag_entry.get("preserve_content"):
+                        return tag_entry["replacement"].get("etag", "")
+                    break
+
+            if not matched:
+                if self._is_in_preserved_context():
+                    self.has_mismatched_closing_tags = True
+                    return tag_text
+            return ""
+
+        elif is_self_closing:
+            if behavior == TagBehavior.PRESERVE_CONTENT:
+                content_type = self._extract_content_type(tag_content)
+                if self._should_preserve_content(tag_name, content_type):
+                    replacement = self._get_content_replacement(content_type)
+                    return replacement.get("stag", "") + replacement.get("etag", "")
+            return ""
+
         else:
-            content = tag_text[1:]
+            content_type = self._extract_content_type(tag_content)
+            preserve_content = self._should_preserve_content(tag_name, content_type)
 
-        content = content.rstrip("/>")
+            replacement = (
+                self._get_content_replacement(content_type) if preserve_content else {}
+            )
 
-        return content.split()[0].lower() if content.split() else content.lower()
+            self.tag_stack.append(
+                {
+                    "name": tag_name,
+                    "behavior": behavior,
+                    "content_type": content_type,
+                    "preserve_content": preserve_content,
+                    "replacement": replacement,
+                }
+            )
+
+            if preserve_content:
+                return replacement.get("stag", "")
+            return ""
+
+    def _might_be_closing_tag(self, tag_text: str) -> bool:
+        """Check if the tag might be a closing tag for any tag in our stack."""
+        if not tag_text.startswith("</"):
+            return False
+
+        tag_content = tag_text[1:-1] if tag_text.endswith(">") else tag_text[1:]
+        tag_name = self._extract_tag_name_quick(tag_content)
+
+        for tag_entry in self.tag_stack:
+            if tag_entry["name"] == tag_name:
+                return True
+        return False
+
+    def _is_in_removal_context(self) -> bool:
+        """Check if we're currently in a removal context.
+        ANY REMOVE_ALL tag in the stack means we're in removal context."""
+        for tag_entry in self.tag_stack:
+            if tag_entry.get("behavior") == TagBehavior.REMOVE_ALL:
+                return True
+        return False
+
+    def _is_in_preserved_context(self) -> bool:
+        """Check if we're currently in a content-preserving context.
+        The most recent (top of stack) tag's behavior takes precedence."""
+        if not self.tag_stack:
+            return False
+        top_tag = self.tag_stack[-1]
+        return top_tag.get("preserve_content", False)
+
+    def _is_in_filtered_context(self) -> bool:
+        """Check if we're currently in any filtered context."""
+        return len(self.tag_stack) > 0
+
+    def _should_output_char(self, char: str) -> bool:
+        """Determine if a character should be output based on current context."""
+        if not self._is_in_filtered_context():
+            return True
+        if self._is_in_removal_context():
+            return False
+        return self._is_in_preserved_context()
 
     def filter_chunk(self, chunk: str) -> str:
-        """Filter chunk by removing complete special tags."""
+        """Filter chunk with minimal buffering and maximum streaming efficiency."""
         if not chunk:
             return ""
 
-        self.buffer += chunk
+        if (
+            self.state == FilterState.NORMAL
+            and not self.tag_stack
+            and not self.buffer
+            and not self._quick_scan_for_filtered_content(chunk)
+            and "<" not in chunk
+        ):
+            return chunk
+
         result = ""
         i = 0
 
-        while i < len(self.buffer):
-            if self.buffer[i] != "<":
-                result += self.buffer[i]
-                i += 1
-                continue
+        while i < len(chunk):
+            char = chunk[i]
 
-            j = i + 1
-            while j < len(self.buffer) and self.buffer[j] != ">":
-                j += 1
-
-            if j >= len(self.buffer):
-                partial_tag = self.buffer[i:]
-                if self._starts_with_special_tag(partial_tag):
-                    break
+            if self.state == FilterState.NORMAL:
+                if char == "<":
+                    self.state = FilterState.POTENTIAL_TAG
+                    self.buffer = "<"
                 else:
-                    result += self.buffer[i]
+                    if self._should_output_char(char):
+                        result += char
+                i += 1
+
+            elif self.state == FilterState.POTENTIAL_TAG:
+                self.buffer += char
+
+                if char == ">":
+                    tag_output = self._process_complete_tag(self.buffer)
+
+                    if not self._is_in_removal_context():
+                        result += tag_output
+
+                    self.buffer = ""
+                    self.state = FilterState.NORMAL
                     i += 1
+
+                elif len(self.buffer) > 1 and self.buffer.lower().startswith(
+                    "<![cdata["
+                ):
+                    self.state = FilterState.IN_CDATA
+                    i += 1
+
+                elif len(self.buffer) > 256:
+                    first_char = self.buffer[0]
+                    if self._should_output_char(first_char):
+                        result += first_char
+
+                    self.buffer = self.buffer[1:]
+
+                    if not self.buffer or not self.buffer.startswith("<"):
+                        if self.buffer:
+                            for buf_char in self.buffer:
+                                if self._should_output_char(buf_char):
+                                    result += buf_char
+                        self.buffer = ""
+                        self.state = FilterState.NORMAL
                     continue
+                else:
+                    i += 1
 
-            complete_tag = self.buffer[i : j + 1]
-            tag_name = self._extract_tag_name(complete_tag)
-
-            if tag_name in self.filtered_tags:
-                pass
-            else:
-                result += complete_tag
-
-            i = j + 1
-
-        if i < len(self.buffer):
-            self.buffer = self.buffer[i:]
-        else:
-            self.buffer = ""
+            elif self.state == FilterState.IN_CDATA:
+                self.buffer += char
+                if self.buffer.endswith("]]>"):
+                    self.buffer = ""
+                    self.state = FilterState.NORMAL
+                i += 1
 
         return result
 
     def finalize(self) -> str:
-        """Get any remaining content from buffer when stream ends."""
-        result = self.buffer
-        self.buffer = ""
+        """Finalize the stream and return any remaining content."""
+        result = ""
+
+        if self.buffer:
+            if self.state == FilterState.POTENTIAL_TAG:
+                buffer_lower = self.buffer.lower()
+                is_filtered = False
+
+                for tag_name in self.tag_config.keys():
+                    if buffer_lower.startswith(
+                        f"<{tag_name}"
+                    ) or buffer_lower.startswith(f"</{tag_name}"):
+                        is_filtered = True
+                        break
+
+                if not is_filtered and self._should_output_char(self.buffer[0]):
+                    result += self.buffer
+            elif self.state == FilterState.NORMAL and self._should_output_char(
+                self.buffer[0]
+            ):
+                result += self.buffer
+
+        if not self.has_mismatched_closing_tags:
+            for tag_entry in reversed(self.tag_stack):
+                if tag_entry.get("preserve_content"):
+                    if tag_entry.get("replacement"):
+                        result += tag_entry["replacement"].get("etag", "")
+
+        self.reset_state()
+
         return result
 
 
@@ -2799,8 +3232,8 @@ class StreamProcessor:
     @staticmethod
     def process_non_stream_response(
         response: requests.Response, context: StreamingContext
-    ) -> str:
-        """Process non-streaming response and return complete content."""
+    ) -> Union[str, Dict[str, Any]]:
+        """Process non-streaming response and return complete content or image response."""
         print("Processing non-streaming response")
 
         full_response = ""
@@ -2815,11 +3248,10 @@ class StreamProcessor:
                     line_data = json.loads(chunk.decode("utf-8").strip())
 
                     if line_data.get("error"):
-                        print(
-                            f"API error: {json.dumps(line_data, indent=2)}",
-                            "StreamProcessor",
-                        )
-                        return json.dumps({"error": "RateLimitError"}) + "\n\n"
+                        error_info = line_data.get("error", {})
+                        error_message = error_info.get("message", "Unknown error")
+                        print(f"API error: {json.dumps(line_data, indent=2)}")
+                        return f"Error: {error_message}"
 
                     response_data = line_data.get("result", {}).get("response")
                     if not response_data:
@@ -2836,7 +3268,6 @@ class StreamProcessor:
                         continue
 
                     if result.token:
-                        # Apply streaming tag filter to remove configured tags
                         filtered_token = context.tag_filter.filter_chunk(result.token)
                         if filtered_token:
                             full_response += filtered_token
@@ -2845,15 +3276,16 @@ class StreamProcessor:
                         image_content = context.image_handler.handle_image_response(
                             result.image_url
                         )
-                        return image_content
+                        return MessageProcessor.create_chat_completion_with_content(
+                            image_content, context.model
+                        )
 
                 except json.JSONDecodeError:
                     continue
                 except Exception as e:
-                    print(f"Error processing response line: {e}", "StreamProcessor")
+                    print(f"Error processing response line: {e}")
                     continue
 
-            # Finalize the tag filter to get any remaining content
             final_content = context.tag_filter.finalize()
             if final_content:
                 full_response += final_content
@@ -2861,7 +3293,7 @@ class StreamProcessor:
             return full_response
 
         except Exception as e:
-            print(f"Non-stream response processing failed: {e}", "StreamProcessor")
+            print(f"Non-stream response processing failed: {e}")
             raise
 
     @staticmethod
@@ -2882,10 +3314,7 @@ class StreamProcessor:
                     line_data = json.loads(chunk.decode("utf-8").strip())
 
                     if line_data.get("error"):
-                        print(
-                            f"API error: {json.dumps(line_data, indent=2)}",
-                            "StreamProcessor",
-                        )
+                        print(f"API error: {json.dumps(line_data, indent=2)}")
                         yield json.dumps({"error": "RateLimitError"}) + "\n\n"
                         return
 
@@ -2904,10 +3333,8 @@ class StreamProcessor:
                         continue
 
                     if result.token:
-                        # Apply streaming tag filter to remove configured tags
                         filtered_token = context.tag_filter.filter_chunk(result.token)
 
-                        # Only yield if we have content after filtering
                         if filtered_token:
                             formatted_response = (
                                 MessageProcessor.create_chat_completion_chunk(
@@ -2921,7 +3348,7 @@ class StreamProcessor:
                             result.image_url
                         )
                         formatted_response = (
-                            MessageProcessor.create_chat_completion_chunk(
+                            MessageProcessor.create_chat_completion_chunk_with_content(
                                 image_content, context.model
                             )
                         )
@@ -2930,10 +3357,9 @@ class StreamProcessor:
                 except json.JSONDecodeError:
                     continue
                 except Exception as e:
-                    print(f"Error processing stream line: {e}", "StreamProcessor")
+                    print(f"Error processing stream line: {e}")
                     continue
 
-            # Finalize the tag filter to get any remaining content
             final_content = context.tag_filter.finalize()
             if final_content:
                 formatted_response = MessageProcessor.create_chat_completion_chunk(
@@ -2971,6 +3397,24 @@ class MessageProcessor:
         }
 
     @staticmethod
+    def create_chat_completion_with_content(content: Any, model: str) -> Dict[str, Any]:
+        """Create a complete chat completion response with content array support."""
+        return {
+            "id": f"chatcmpl-{uuid.uuid4()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": None,
+        }
+
+    @staticmethod
     def create_chat_completion_chunk(message: str, model: str) -> Dict[str, Any]:
         """Create a streaming chat completion chunk."""
         return {
@@ -2979,6 +3423,19 @@ class MessageProcessor:
             "created": int(time.time()),
             "model": model,
             "choices": [{"index": 0, "delta": {"content": message}}],
+        }
+
+    @staticmethod
+    def create_chat_completion_chunk_with_content(
+        content: Any, model: str
+    ) -> Dict[str, Any]:
+        """Create a streaming chat completion chunk with content array support."""
+        return {
+            "id": f"chatcmpl-{uuid.uuid4()}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": content}}],
         }
 
     @staticmethod
@@ -3025,7 +3482,7 @@ class AuthenticationService:
                     )
                     success = self.token_manager.add_token(credential)
                     if not success:
-                        print("Failed to add custom SSO token", "AuthenticationService")
+                        print("Failed to add custom SSO token")
                     return True
                 except Exception as e:
                     print(
@@ -3036,14 +3493,14 @@ class AuthenticationService:
             else:
                 expected_key = self.config.get("API.API_KEY", "sk-123456")
                 if auth_token != expected_key:
-                    print(f"Invalid API key provided", "AuthenticationService")
+                    print(f"Invalid API key provided")
                     raise ValidationException("Invalid API key")
                 return True
 
         except ValidationException:
             raise
         except Exception as e:
-            print(f"Authentication processing failed: {e}", "AuthenticationService")
+            print(f"Authentication processing failed: {e}")
             raise ValidationException(f"Authentication failed: {e}") from e
 
 
@@ -3103,7 +3560,7 @@ def create_app(config: ConfigurationManager) -> Flask:
     @app.route("/v1/chat/completions", methods=["POST"])
     def chat_completions():
         """Main chat completions endpoint with clean separation of concerns."""
-        response_status_code = 500
+        response_status_code = None
 
         try:
             if not request.is_json:
@@ -3161,6 +3618,8 @@ def create_app(config: ConfigurationManager) -> Flask:
                         print(
                             f"API request failed with status {response.status_code}: {error_text}"
                         )
+                        print(f"Full response headers: {dict(response.headers)}")
+                        print(f"Full response content: {error_text[:2000]}")
 
                         if used_token:
                             token_manager.record_token_failure(
@@ -3188,18 +3647,24 @@ def create_app(config: ConfigurationManager) -> Flask:
                     print(f"Request failed, retrying in {delay}s: {e}")
                     time.sleep(delay)
 
-            if not response or response.status_code != 200:
-                error_msg = f"Request failed with status: {response_status_code}"
+            if not response:
+                error_msg = "Request failed: No response received"
+                raise GrokApiException(error_msg, "REQUEST_FAILED")
+            elif response.status_code != 200:
+                if response_status_code:
+                    error_msg = f"Request failed with status: {response_status_code}"
+                else:
+                    error_msg = f"Request failed with status: {response.status_code}"
                 raise GrokApiException(error_msg, "REQUEST_FAILED")
 
-            # Get configured filtered tags
-            filtered_tags = config.get("FILTERED_TAGS", ["xaiArtifact"])
+            tag_config = config.get("TAG_CONFIG", {})
+            content_type_mappings = config.get("CONTENT_TYPE_MAPPINGS", {})
 
             context = StreamingContext(
                 model=model,
                 processor=response_processor,
                 image_handler=image_handler,
-                tag_filter=StreamingTagFilter(filtered_tags),
+                tag_filter=StreamingTagFilter(tag_config, content_type_mappings),
             )
 
             if stream:
@@ -3224,12 +3689,15 @@ def create_app(config: ConfigurationManager) -> Flask:
                     },
                 )
             else:
-                message_content = StreamProcessor.process_non_stream_response(
+                response_result = StreamProcessor.process_non_stream_response(
                     response, context
                 )
-                formatted_response = MessageProcessor.create_chat_completion(
-                    message_content, model
-                )
+                if isinstance(response_result, dict):
+                    formatted_response = response_result
+                else:
+                    formatted_response = MessageProcessor.create_chat_completion(
+                        response_result, model
+                    )
                 return jsonify(formatted_response)
 
         except (
@@ -3545,7 +4013,7 @@ def initialize_application(
                     if token_manager.add_token(credential, is_initialization=True):
                         tokens_added += 1
                 except Exception as e:
-                    print(f"Failed to add normal token: {e}", "Initialization")
+                    print(f"Failed to add normal token: {e}")
 
     sso_super_tokens = os.environ.get("SSO_SUPER", "")
     if sso_super_tokens:
@@ -3557,7 +4025,7 @@ def initialize_application(
                     if token_manager.add_token(credential, is_initialization=True):
                         tokens_added += 1
                 except Exception as e:
-                    print(f"Failed to add super token: {e}", "Initialization")
+                    print(f"Failed to add super token: {e}")
 
     if tokens_added > 0:
         print(f"Successfully loaded {tokens_added} tokens")
@@ -3570,21 +4038,25 @@ def initialize_application(
             )
 
     proxy_url = config.get("API.PROXY")
-    initialize_statsig_manager(proxy_url=proxy_url)
-    if proxy_url:
-        print(f"StatsigManager initialized with proxy: {proxy_url}", "Initialization")
-    else:
-        print("StatsigManager initialized without proxy")
 
-    try:
-        statsig_manager = get_statsig_manager()
-        real_ip = statsig_manager.check_real_ip_sync()
-        if real_ip and real_ip not in ["error", "failed", "unknown"]:
-            print(f"Playwright real IP address: {real_ip}")
+    if not config.get("API.DISABLE_DYNAMIC_HEADERS", False):
+        initialize_statsig_manager(proxy_url=proxy_url)
+        if proxy_url:
+            print(f"StatsigManager initialized with proxy: {proxy_url}")
         else:
-            print(f"Failed to get real IP address: {real_ip}")
-    except Exception as e:
-        print(f"Error checking real IP address: {e}")
+            print("StatsigManager initialized without proxy")
+
+        try:
+            statsig_manager = get_statsig_manager()
+            real_ip = statsig_manager.check_real_ip_sync()
+            if real_ip and real_ip not in ["error", "failed", "unknown"]:
+                print(f"Playwright real IP address: {real_ip}")
+            else:
+                print(f"Failed to get real IP address: {real_ip}")
+        except Exception as e:
+            print(f"Error checking real IP address: {e}")
+    else:
+        print("Dynamic headers disabled - skipping StatsigManager initialization")
 
     print("Application initialization completed")
 

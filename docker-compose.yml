@@ -7,6 +7,7 @@ services:
       - IS_TEMP_CONVERSATION=true
       - SHOW_SEARCH_RESULTS=true
       - SHOW_THINKING=true
+      - DISABLE_DYNAMIC_HEADERS=true
     volumes:
       - ./data:/data
     ports:

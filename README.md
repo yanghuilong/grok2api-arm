@@ -34,9 +34,85 @@
 | `PORT` | 服务端口 | `5200` | 数字 | `8080` |
 | `PROXY` | 代理服务器 | - | HTTP/SOCKS5 URL | `http://127.0.0.1:1080` |
 | `CF_CLEARANCE` | Cloudflare 令牌 | - | CF 令牌字符串 | `cf_clearance_token` |
-| `PICGO_KEY` | PICGO 图床 API 密钥 | - | 字符串 | `picgo_api_key` |
-| `TUMY_KEY` | Tumy 图床 API 密钥 | - | 字符串 | `tumy_api_key` |
-| `FILTERED_TAGS` | 过滤标签列表 | `xaiArtifact` | 逗号分隔 | `tag1,tag2,tag3` |
+| `FILTERED_TAGS` | 过滤标签列表 | `xaiartifact,xai:tool_usage_card,grok:render,details,summary` | 逗号分隔 | `tag1,tag2,tag3` |
+| `TAG_CONFIG` | 过滤标签配置 | `{"xaiartifact":{"behavior":"preserve_content"},"xai:tool_usage_card":{"behavior":"remove_all"},"grok:render":{"behavior":"remove_all"},"details":{"behavior":"preserve_content"},"summary":{"behavior":"preserve_content"}}` | json | `{"xaiartifact":{"behavior":"preserve_content"},"xai:tool_usage_card":{"behavior":"remove_all"},"grok:render":{"behavior":"remove_all"},"details":{"behavior":"preserve_content"},"summary":{"behavior":"preserve_content"}}` |
+| `CONTENT_TYPE_MAPPINGS` | 过滤标签重写配置 | 太长了,看源码 | json | {"text/plain":{"stag":"```","etag":"```"},"text/python":{"stag":"```python\n","etag":"\n```"}} |
+
+### 标签过滤配置
+
+添加了高级标签过滤功能，可在流式响应中自动处理特定的 XML/HTML 标签。
+
+注意配置错误会直接破坏输出!!!
+
+#### FILTERED_TAGS
+
+**描述**：标签过滤列表, 当遇到不在列表中的标签时会立即放弃后续重写
+
+**格式**：逗号分隔的标签名称，小写
+
+**默认值**：`xaiartifact,xai:tool_usage_card,grok:render,details,summary`
+
+**示例**：
+```bash
+FILTERED_TAGS=xaiartifact,grok:render,grok:thinking
+```
+
+#### TAG_CONFIG
+
+**描述**：高级标签行为配置，支持为不同标签设置不同的处理策略。
+
+**格式**：JSON 对象，键为标签名称（小写），值为配置对象
+
+**配置选项**：
+- `behavior`: 标签行为
+  - `"preserve_content"`: 保留内容，添加格式化标记
+  - `"remove_all"`: 完全移除标签和内容
+
+**默认值**：基于 FILTERED_TAGS 自动生成
+
+**示例**：
+```json
+{
+  "xaiartifact": {"behavior": "preserve_content"},
+  "xai:tool_usage_card": {"behavior": "remove_all"},
+  "grok:render": {"behavior": "remove_all"},
+  "details": {"behavior": "preserve_content"},
+  "summary": {"behavior": "preserve_content"}
+}
+```
+
+**在 docker-compose.yml 中配置**：
+```yaml
+environment:
+  TAG_CONFIG: '{"xaiartifact":{"behavior":"preserve_content"},"xai:tool_usage_card":{"behavior":"remove_all"},"grok:render":{"behavior":"remove_all"},"details":{"behavior":"preserve_content"},"summary":{"behavior":"preserve_content"}}'
+```
+
+#### CONTENT_TYPE_MAPPINGS
+
+**描述**：内容类型映射配置，定义不同 contentType 的格式化标记。
+
+**格式**：JSON 对象，键为 MIME 类型，值为包含 stag（开始标记）和 etag（结束标记）的对象
+
+**默认映射**：
+```json
+{
+  "text/plain": {"stag": "```", "etag": "```"},
+  "text/markdown": {"stag": "", "etag": ""},
+  "application/json": {"stag": "```json\n", "etag": "\n```"}
+}
+```
+
+**示例配置**：
+```yaml
+environment:
+  CONTENT_TYPE_MAPPINGS: '{"text/plain":{"stag":"```","etag":"```"},"text/python":{"stag":"```python\n","etag":"\n```"}}'
+```
+
+**工作原理**：
+1. 当遇到 `preserve_content` 行为的标签时，会查找标签的 `contentType` 属性
+2. 根据 `contentType` 在映射表中查找对应的格式化标记
+3. 用 `stag` + 内容 + `etag` 替换原始标签和对应的封闭标签
+
 
 ## 快速开始
 
