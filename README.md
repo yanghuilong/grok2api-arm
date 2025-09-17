@@ -34,6 +34,7 @@
 | `PORT` | 服务端口 | `5200` | 数字 | `8080` |
 | `PROXY` | 代理服务器 | - | HTTP/SOCKS5 URL | `http://127.0.0.1:1080` |
 | `CF_CLEARANCE` | Cloudflare 令牌 | - | CF 令牌字符串 | `cf_clearance_token` |
+| `DISABLE_DYNAMIC_HEADERS` | 禁用动态头部获取（禁用 Playwright 自动获取 x-statsig-id） | `false` | `true/false` | `true` |
 | `FILTERED_TAGS` | 过滤标签列表 | `xaiartifact,xai:tool_usage_card,grok:render,details,summary` | 逗号分隔 | `tag1,tag2,tag3` |
 | `TAG_CONFIG` | 过滤标签配置 | `{"xaiartifact":{"behavior":"preserve_content"},"xai:tool_usage_card":{"behavior":"remove_all"},"grok:render":{"behavior":"remove_all"},"details":{"behavior":"preserve_content"},"summary":{"behavior":"preserve_content"}}` | json | `{"xaiartifact":{"behavior":"preserve_content"},"xai:tool_usage_card":{"behavior":"remove_all"},"grok:render":{"behavior":"remove_all"},"details":{"behavior":"preserve_content"},"summary":{"behavior":"preserve_content"}}` |
 | `CONTENT_TYPE_MAPPINGS` | 过滤标签重写配置 | 太长了,看源码 | json | {"text/plain":{"stag":"```","etag":"```"},"text/python":{"stag":"```python\n","etag":"\n```"}} |
