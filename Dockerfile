@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir flask requests curl_cffi werkzeug loguru python-dotenv playwright gunicorn
 
-RUN python -m playwright install --with-deps chrome
+RUN python -m playwright install --with-deps chromium
 
 COPY . .
 
